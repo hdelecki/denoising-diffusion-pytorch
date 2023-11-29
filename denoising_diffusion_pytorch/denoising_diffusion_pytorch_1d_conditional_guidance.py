@@ -10,7 +10,7 @@ from torch import nn, einsum, Tensor
 import torch.nn.functional as F
 from torch.cuda.amp import autocast
 from torch.optim import Adam
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 
 from einops import rearrange, reduce, repeat
 from einops.layers.torch import Rearrange
@@ -102,7 +102,8 @@ class Dataset1DConditional(Dataset):
         return len(self.tensor)
 
     def __getitem__(self, idx):
-        return self.tensor[idx].clone(), self.condition_tensor[idx].clone()
+        # return self.tensor[idx].clone(), self.condition_tensor[idx].clone()
+        return self.tensor[idx], self.condition_tensor[idx]
 
 # small helper modules
 
@@ -341,7 +342,8 @@ class Unet1DCFG(nn.Module):
         )
 
         # Conditional embeddings
-        self.null_classes_emb = nn.Parameter(-torch.ones(cond_dim))
+        self.null_classes_emb = nn.Parameter(-1.0 * torch.ones(cond_dim))
+        #self.null_classes_emb = nn.Parameter(torch.randn(cond_dim))
 
         # layers
 
@@ -542,6 +544,7 @@ class GaussianDiffusion1DConditional(nn.Module):
         super().__init__()
         self.model = model
         self.channels = self.model.channels
+        self.cond_dim = self.model.cond_dim
         self.self_condition = False
 
         self.seq_length = seq_length
@@ -655,7 +658,7 @@ class GaussianDiffusion1DConditional(nn.Module):
         posterior_log_variance_clipped = extract(self.posterior_log_variance_clipped, t, x_t.shape)
         return posterior_mean, posterior_variance, posterior_log_variance_clipped
 
-    def model_predictions(self, x, t, cond, cond_scale = 6., rescaled_phi = 0.7, clip_x_start = False, rederive_pred_noise = False):
+    def model_predictions(self, x, t, cond, cond_scale = 1., rescaled_phi = 0.7, clip_x_start = False, rederive_pred_noise = False):
         model_output = self.model.forward_with_cond_scale(x, t, cond, cond_scale = cond_scale, rescaled_phi = rescaled_phi)
         maybe_clip = partial(torch.clamp, min = self.clip_min, max = self.clip_max) if clip_x_start else identity
 
@@ -691,7 +694,7 @@ class GaussianDiffusion1DConditional(nn.Module):
         return model_mean, posterior_variance, posterior_log_variance, x_start
 
     @torch.no_grad()
-    def p_sample(self, x, t: int, cond, cond_scale = 6., rescaled_phi = 0.7, clip_denoised = True):
+    def p_sample(self, x, t: int, cond, cond_scale = 1., rescaled_phi = 0.7, clip_denoised = True):
         b, *_, device = *x.shape, x.device
         batched_times = torch.full((b,), t, device = x.device, dtype = torch.long)
         model_mean, _, model_log_variance, x_start = self.p_mean_variance(x = x, t = batched_times, cond=cond, cond_scale = cond_scale, rescaled_phi = rescaled_phi, clip_denoised = clip_denoised)
@@ -700,7 +703,7 @@ class GaussianDiffusion1DConditional(nn.Module):
         return pred_img, x_start
 
     @torch.no_grad()
-    def p_sample_loop(self, shape, cond, cond_scale = 6., rescaled_phi = 0.7):
+    def p_sample_loop(self, shape, cond, cond_scale = 1., rescaled_phi = 0.7):
         batch, device = shape[0], self.betas.device
 
         img = torch.randn(shape, device=device)
@@ -715,7 +718,7 @@ class GaussianDiffusion1DConditional(nn.Module):
         return img
 
     @torch.no_grad()
-    def ddim_sample(self, shape, cond, cond_scale = 6., rescaled_phi = 0.7, clip_denoised = True):
+    def ddim_sample(self, shape, cond, cond_scale = 1., rescaled_phi = 0.7, clip_denoised = True):
         batch, device, total_timesteps, sampling_timesteps, eta, objective = shape[0], self.betas.device, self.num_timesteps, self.sampling_timesteps, self.ddim_sampling_eta, self.objective
 
         times = torch.linspace(-1, total_timesteps - 1, steps=sampling_timesteps + 1)   # [-1, 0, 1, 2, ..., T-1] when sampling_timesteps == total_timesteps
@@ -751,7 +754,7 @@ class GaussianDiffusion1DConditional(nn.Module):
         return img
 
     @torch.no_grad()
-    def sample(self, cond, cond_scale = 6., rescaled_phi = 0.7):
+    def sample(self, cond, cond_scale = 1., rescaled_phi = 0.7):
         batch_size = cond.shape[0]
         seq_length, channels = self.seq_length, self.channels
         sample_fn = self.p_sample_loop if not self.is_ddim_sampling else self.ddim_sample
@@ -1011,3 +1014,351 @@ class Trainer1DConditional(object):
                 pbar.update(1)
 
         accelerator.print('training complete')
+
+
+
+
+class IterativeTrainer(object):
+    def __init__(
+        self,
+        diffusion_model: GaussianDiffusion1DConditional,
+        dataset: Dataset,
+        *,
+        rho_target = 3.0,
+        alpha = 0.7,
+        N = 1000,
+        px = torch.distributions.Normal(0, 1),
+        robustness = lambda x: torch.abs(x),
+        rho_upper_bound = 3.5,
+        train_batch_size = 16,
+        gradient_accumulate_every = 1,
+        train_lr = 1e-4,
+        train_num_steps = 100000,
+        ema_update_every = 10,
+        ema_decay = 0.995,
+        adam_betas = (0.9, 0.99),
+        save_and_sample_every = 1000,
+        num_samples = 4,
+        results_folder = './results',
+        amp = False,
+        mixed_precision_type = 'fp16',
+        sample_conds = [-1.0, -0.33, 0.33, 1.0],
+        split_batches = True,
+        max_grad_norm = 1.,
+        sample_callback=None,
+    ):
+        super().__init__()
+
+        self.rho_target = rho_target
+        self.alpha = alpha
+        self.N = N
+        self.px = px
+        self.robustness = robustness
+        self.rho_upper_bound = rho_upper_bound
+        self.train_batch_size = train_batch_size
+
+        # accelerator
+
+        self.accelerator = Accelerator(
+            split_batches = split_batches,
+            mixed_precision = mixed_precision_type if amp else 'no'
+        )
+
+        # model
+
+        self.model = diffusion_model
+        self.channels = diffusion_model.channels
+
+        # sampling and training hyperparameters
+
+        assert has_int_squareroot(num_samples), 'number of samples must have an integer square root'
+        self.num_samples = num_samples
+        self.save_and_sample_every = save_and_sample_every
+
+        self.batch_size = train_batch_size
+        self.gradient_accumulate_every = gradient_accumulate_every
+        self.max_grad_norm = max_grad_norm
+
+        self.train_num_steps = train_num_steps
+
+        # dataset and dataloader
+        self.dataset = dataset
+        dl = DataLoader(dataset, batch_size = train_batch_size, shuffle = True, pin_memory = True, num_workers = cpu_count())
+
+        dl = self.accelerator.prepare(dl)
+        self.dl = cycle(dl)
+
+        # optimizer
+
+        self.opt = Adam(diffusion_model.parameters(), lr = train_lr, betas = adam_betas)
+
+        # for logging results in a folder periodically
+
+        if self.accelerator.is_main_process:
+            self.ema = EMA(diffusion_model, beta = ema_decay, update_every = ema_update_every)
+            self.ema.to(self.device)
+
+        self.results_folder = Path(results_folder)
+        self.results_folder.mkdir(exist_ok = True)
+
+        # step counter state
+
+        self.step = 0
+
+        # prepare model, dataloader, optimizer with accelerator
+
+        self.model, self.opt = self.accelerator.prepare(self.model, self.opt)
+
+        self.sample_conds = torch.tensor(sample_conds)
+        self.sample_callback = sample_callback
+
+    @property
+    def device(self):
+        return self.accelerator.device
+
+    def save(self, milestone):
+        if not self.accelerator.is_local_main_process:
+            return
+
+        data = {
+            'step': self.step,
+            'model': self.accelerator.get_state_dict(self.model),
+            'opt': self.opt.state_dict(),
+            'ema': self.ema.state_dict(),
+            'scaler': self.accelerator.scaler.state_dict() if exists(self.accelerator.scaler) else None,
+        }
+
+        torch.save(data, str(self.results_folder / f'model-{milestone}.pt'))
+
+    def load(self, milestone):
+        accelerator = self.accelerator
+        device = accelerator.device
+
+        data = torch.load(str(self.results_folder / f'model-{milestone}.pt'), map_location=device)
+
+        model = self.accelerator.unwrap_model(self.model)
+        model.load_state_dict(data['model'])
+
+        self.step = data['step']
+        self.opt.load_state_dict(data['opt'])
+        if self.accelerator.is_main_process:
+            self.ema.load_state_dict(data["ema"])
+
+        if 'version' in data:
+            print(f"loading from version {data['version']}")
+
+        if exists(self.accelerator.scaler) and exists(data['scaler']):
+            self.accelerator.scaler.load_state_dict(data['scaler'])
+
+    def initial_training(self):
+        accelerator = self.accelerator
+        device = accelerator.device
+
+        with tqdm(initial = self.step, total = self.train_num_steps, disable = not accelerator.is_main_process) as pbar:
+
+            while self.step < self.train_num_steps:
+
+                total_loss = 0.
+
+                for _ in range(self.gradient_accumulate_every):
+                    data, cond = next(self.dl)
+                    data.to(device)
+                    cond.to(device)
+
+                    with self.accelerator.autocast():
+                        loss = self.model(data, cond)
+                        loss = loss / self.gradient_accumulate_every
+                        total_loss += loss.item()
+
+                    self.accelerator.backward(loss)
+
+                pbar.set_description(f'loss: {total_loss:.4f}')
+
+                accelerator.wait_for_everyone()
+                accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+
+                self.opt.step()
+                self.opt.zero_grad()
+
+                accelerator.wait_for_everyone()
+
+                self.step += 1
+                if accelerator.is_main_process:
+                    self.ema.update()
+
+                    if self.step != 0 and self.step % self.save_and_sample_every == 0:
+                        self.ema.ema_model.eval()
+
+                        with torch.no_grad():
+                            milestone = self.step // self.save_and_sample_every
+                            batches = num_to_groups(self.num_samples, self.batch_size)
+                            sample_conds = torch.cat([c*torch.ones(batches[0], 2, device=device) for c in self.sample_conds], 0)
+                            #cond = 0.33*torch.ones(self.num_samples, self.model.channels, self.model.seq_length, device=device)
+                            #all_samples_list = list(map(lambda n: self.ema.ema_model.sample(cond, batch_size=n), batches))
+                            all_samples = self.ema.ema_model.sample(sample_conds)
+
+                        #all_samples = torch.cat(all_samples_list, dim = 0)
+                        #plot_img_grid(all_samples.detach().cpu().unsqueeze(1), f'{self.results_folder}/sample-{milestone}.png')
+                        #print(all_samples)
+                        #torch.save(all_samples, str(self.results_folder / f'sample-{milestone}.png'))
+                        if self.sample_callback is not None:
+                            self.sample_callback(all_samples, milestone)
+                        self.save(milestone)
+
+                pbar.update(1)
+
+        accelerator.print('initial training complete')
+
+
+    def train(self):
+        accelerator = self.accelerator
+        device = accelerator.device
+
+        self.initial_training()
+
+        rho = 0.0
+
+        data = self.dataset.tensor.clone().detach() #.to(device)
+        conds = self.dataset.condition_tensor.clone().detach()#.to(device)
+        print(data.device)
+        k = 0
+        while rho < self.rho_target:
+            # Sample from the model with condition >= rho
+            print("rho = {}".format(rho))
+            print("sampling from model...")
+            rho_sample = torch.distributions.Uniform(rho, self.rho_upper_bound).sample((self.N,))
+            #rho_sample = self.rho_target*torch.ones(self.N,)
+
+            # Stack rho_sample to be self.cond_dim
+            rho_sample = rho_sample.unsqueeze(1).repeat(1, self.model.cond_dim).to(device)
+
+            # Sample from the model
+            with torch.no_grad():
+                samples = self.model.sample(rho_sample, cond_scale = 1., rescaled_phi = 0.7)
+
+
+            # Evaluate robustness of each sample
+            robustness = torch.tensor([self.robustness(sample) for sample in samples]).to(device)
+            print("maximum robustness sampled: {}".format(robustness.max()))
+
+            # Save off samples and robustness
+            torch.save(samples, str(self.results_folder / f'samples-{k}.pt'))
+            torch.save(robustness, str(self.results_folder / f'robustness-{k}.pt'))
+
+
+            # Compute the (1-alpha) quantile of robustness
+            rho = torch.quantile(robustness, self.alpha).item()
+            rho = min(rho, self.rho_target)
+            print("updated rho = {}".format(rho))
+
+            # Remove samples from data with condition < rho
+            elite_samples = samples[robustness >= rho, :, :]
+            elite_rs = robustness[robustness >= rho]
+            elite_rs = elite_rs.unsqueeze(1).repeat(1, 2)
+            # elite_rs = elite_rs.contiguous().unsqueeze(1).expand(-1, 2)
+
+            # Add samples and conditions to dataset
+            data = torch.cat((data.clone(), elite_samples.cpu().clone()), dim=0)
+            conds = torch.cat((conds.clone(), elite_rs.cpu().clone()), dim=0)
+
+            # Keep only samples with condition >= rho
+            mask = conds[:, 0] >= rho
+            data = data[mask, :, :].clone()
+            conds = conds[mask, :].clone()
+
+            print("length of data: {}".format(data.shape[0]))
+            print("mean of data: {}".format(data.mean()))
+            print("std of data: {}".format(data.std()))
+            print("min of data: {}".format(data.min()))
+            print("max of data: {}".format(data.max()))
+
+            print(self.robustness(data[0, :, :]))
+            print(conds[0])
+
+            # Save off updated data and conds
+            torch.save(data.cpu(), str(self.results_folder / f'data-{k}.pt'))
+            torch.save(conds.cpu(), str(self.results_folder / f'conds-{k}.pt'))
+
+            # Compute sample weights according to data likelihood under px
+            weights = torch.exp(self.px.log_prob(data.to('cpu')).sum(dim=1)).to(device)
+
+            # Create dataloader with WeightedRandomSampler
+            dataset = Dataset1DConditional(data.cpu(), conds.cpu())
+            print("length of dataset: {}".format(len(dataset)))
+            sampler = WeightedRandomSampler(weights, len(weights))
+            dl = DataLoader(dataset, batch_size = self.train_batch_size, pin_memory = True, num_workers = cpu_count(), sampler=sampler)
+            dl = self.accelerator.prepare(dl)
+
+            dl_cycle = cycle(dl)
+
+            #ipdb.set_trace(context=6)
+
+            print("Training on updated data with {} samples...".format(data.shape[0]))
+            step=0
+            with tqdm(initial = step, total = self.train_num_steps, disable = not accelerator.is_main_process) as pbar:
+                    while step < self.train_num_steps:
+
+                        total_loss = 0.
+
+                        for _ in range(self.gradient_accumulate_every):
+                            databatch, condbatch = next(dl_cycle)
+                            databatch.to(device)
+                            condbatch.to(device)
+
+                            with self.accelerator.autocast():
+                                loss = self.model(databatch, condbatch)
+                                loss = loss / self.gradient_accumulate_every
+                                total_loss += loss.item()
+
+                            self.accelerator.backward(loss)
+
+                        pbar.set_description(f'loss: {total_loss:.4f}')
+
+                        accelerator.wait_for_everyone()
+                        accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+
+                        self.opt.step()
+                        self.opt.zero_grad()
+
+                        accelerator.wait_for_everyone()
+
+                        step += 1
+                        if accelerator.is_main_process:
+                            self.ema.update()
+
+                            if step != 0 and step % self.save_and_sample_every == 0:
+                                self.ema.ema_model.eval()
+
+                                with torch.no_grad():
+                                    milestone = step // self.save_and_sample_every
+                                    batches = num_to_groups(self.num_samples, self.batch_size)
+                                    sample_conds = torch.cat([c*torch.ones(batches[0], 2, device=device) for c in self.sample_conds], 0)
+                                    #cond = 0.33*torch.ones(self.num_samples, self.model.channels, self.model.seq_length, device=device)
+                                    #all_samples_list = list(map(lambda n: self.ema.ema_model.sample(cond, batch_size=n), batches))
+                                    all_samples = self.ema.ema_model.sample(sample_conds)
+
+                                #all_samples = torch.cat(all_samples_list, dim = 0)
+                                #plot_img_grid(all_samples.detach().cpu().unsqueeze(1), f'{self.results_folder}/sample-{milestone}.png')
+                                #print(all_samples)
+                                #torch.save(all_samples, str(self.results_folder / f'sample-{milestone}.png'))
+                                if self.sample_callback is not None:
+                                    self.sample_callback(all_samples, milestone)
+                                self.save(milestone)
+
+                        pbar.update(1)
+
+            self.save(k)
+            k += 1
+
+
+        # Sample from the model with condition >= rho
+        if rho < self.rho_target:
+            rho_sample = torch.distributions.Uniform(rho, self.rho_upper_bound).sample((self.N,))
+        else:
+            rho_sample = rho*torch.ones(self.N,)
+        rho_sample = rho_sample.unsqueeze(1).repeat(1, self.model.cond_dim).to(device)
+        with torch.no_grad():
+            samples = self.model.sample(rho_sample, cond_scale = 1., rescaled_phi = 0.7)
+
+        # save off final samples
+        torch.save(samples, str(self.results_folder / f'samples-{k}.pt'))
