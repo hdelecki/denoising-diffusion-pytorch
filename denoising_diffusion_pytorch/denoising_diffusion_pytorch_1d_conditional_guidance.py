@@ -1280,7 +1280,8 @@ class IterativeTrainer(object):
             torch.save(conds.cpu(), str(self.results_folder / f'conds-{k}.pt'))
 
             # Compute sample weights according to data likelihood under px
-            weights = torch.exp(self.px.log_prob(data.to('cpu')).sum(dim=1)).to(device)
+            log_weights = torch.exp(self.px.log_prob(data.to('cpu')).sum(dim=1)).to(device)
+            weights = (log_weights - log_weights.logsumexp(dim=0, keepdims=True)).exp()
 
             # Create dataloader with WeightedRandomSampler
             dataset = Dataset1DConditional(data.cpu(), conds.cpu())
